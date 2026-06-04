@@ -27,6 +27,7 @@ namespace ExcelMetadataImporter
         private const string ColDeveloper = "Developer";
         private const string ColGenre = "Genre";
         private const string ColRegion = "Region";
+        private const string ColRarity = "Rarity";
 
         // Maps the sheet's region values to cleaner names for Playnite. Values not listed here
         // are used as-is. Empty the map if you want to keep the original sheet values.
@@ -35,8 +36,6 @@ namespace ExcelMetadataImporter
             { "Pal", "PAL" },
             { "Usa", "USA" }
         };
-
-        private const string ColRarity = "Rarity";
 
         // UserScore assigned based on the number of asterisks (index = asterisk count; index 0 is unused).
         // 10 levels, from 1 to 10 asterisks -> from 10 to 100, in steps of 10.
@@ -80,8 +79,8 @@ namespace ExcelMetadataImporter
                 return; // user cancelled
             }
 
-            // 2. Load every sheet separately (sheet name -> rows keyed by game name)
-            List<KeyValuePair<string, Dictionary<string, ExcelRow>>> sheets;
+            // 2. Load every sheet separately
+            List<SheetData> sheets;
             try
             {
                 sheets = LoadAllSheets(path);
@@ -106,7 +105,7 @@ namespace ExcelMetadataImporter
             {
                 new GenericItemOption(allSheetsLabel, "Import from every sheet (merged)")
             };
-            options.AddRange(sheets.Select(s => new GenericItemOption(s.Key, $"{s.Value.Count} games")));
+            options.AddRange(sheets.Select(s => new GenericItemOption(s.Name, $"{s.Complete.Count} games")));
 
             var chosen = PlayniteApi.Dialogs.ChooseItemWithSearch(
                 options,
@@ -121,95 +120,103 @@ namespace ExcelMetadataImporter
                 return; // user cancelled
             }
 
-            // Build the lookup table from the chosen sheet (or merge all)
-            Dictionary<string, ExcelRow> table;
+            // 2c. Build the lookup for the chosen scope.
+            //  - complete: normalized name -> list of complete rows (more than one = ambiguous duplicate)
+            //  - seen:     every game name encountered, even on incomplete rows
+            Dictionary<string, List<ExcelRow>> complete;
+            HashSet<string> seen;
+
             if (chosen.Name == allSheetsLabel)
             {
-                table = new Dictionary<string, ExcelRow>();
+                complete = new Dictionary<string, List<ExcelRow>>();
+                seen = new HashSet<string>();
                 foreach (var sheet in sheets)
                 {
-                    foreach (var kv in sheet.Value)
+                    foreach (var name in sheet.Seen)
                     {
-                        table[kv.Key] = kv.Value; // on duplicates the last sheet wins
+                        seen.Add(name);
+                    }
+                    foreach (var kv in sheet.Complete)
+                    {
+                        if (!complete.TryGetValue(kv.Key, out var list))
+                        {
+                            list = new List<ExcelRow>();
+                            complete[kv.Key] = list;
+                        }
+                        list.AddRange(kv.Value);
                     }
                 }
             }
             else
             {
-                table = sheets.First(s => s.Key == chosen.Name).Value;
+                var sheet = sheets.First(s => s.Name == chosen.Name);
+                complete = sheet.Complete;
+                seen = sheet.Seen;
             }
 
-            // 3. For each selected game: find the row and update the fields
+            // 3. For each selected game: classify and, when unambiguous, update the fields
             int updated = 0;
             var notFound = new List<string>();
+            var duplicates = new List<string>();
+            var missingField = new List<string>();
 
             foreach (var game in games)
             {
                 var key = Normalize(game.Name);
-                if (!table.TryGetValue(key, out var row))
-                {
-                    notFound.Add(game.Name);
-                    continue;
-                }
 
-                bool changed = false;
-
-                if (!string.IsNullOrWhiteSpace(row.Publisher))
+                if (complete.TryGetValue(key, out var matches))
                 {
-                    game.PublisherIds = SplitCompanies(row.Publisher)
-                        .Select(GetOrCreateCompanyId).ToList();
-                    changed = true;
-                }
+                    if (matches.Count > 1)
+                    {
+                        duplicates.Add(game.Name); // same name on multiple complete rows -> handle manually
+                        continue;
+                    }
 
-                if (!string.IsNullOrWhiteSpace(row.Developer))
-                {
-                    game.DeveloperIds = SplitCompanies(row.Developer)
-                        .Select(GetOrCreateCompanyId).ToList();
-                    changed = true;
-                }
+                    var row = matches[0];
+                    game.PublisherIds = SplitCompanies(row.Publisher).Select(GetOrCreateCompanyId).ToList();
+                    game.DeveloperIds = SplitCompanies(row.Developer).Select(GetOrCreateCompanyId).ToList();
+                    game.GenreIds = SplitGenres(row.Genre).Select(GetOrCreateGenreId).ToList();
+                    game.RegionIds = SplitRegions(row.Region).Select(GetOrCreateRegionId).ToList();
 
-                if (!string.IsNullOrWhiteSpace(row.Genre))
-                {
-                    game.GenreIds = SplitGenres(row.Genre)
-                        .Select(GetOrCreateGenreId).ToList();
-                    changed = true;
-                }
-
-                if (!string.IsNullOrWhiteSpace(row.Region))
-                {
-                    game.RegionIds = SplitRegions(row.Region)
-                        .Select(GetOrCreateRegionId).ToList();
-                    changed = true;
-                }
-
-                if (!string.IsNullOrWhiteSpace(row.Rarity))
-                {
                     int stars = row.Rarity.Count(c => c == '*');
                     if (stars >= 1 && stars < RarityScores.Length)
                     {
                         game.UserScore = RarityScores[stars];
-                        changed = true;
                     }
-                }
 
-                if (changed)
-                {
                     PlayniteApi.Database.Games.Update(game);
                     updated++;
                 }
-            }
-
-            // 4. Summary
-            var msg = $"Games updated: {updated} of {games.Count}.";
-            if (notFound.Count > 0)
-            {
-                msg += "\n\nNo matching row found for:\n - " + string.Join("\n - ", notFound.Take(20));
-                if (notFound.Count > 20)
+                else if (seen.Contains(key))
                 {
-                    msg += $"\n ... and {notFound.Count - 20} more.";
+                    missingField.Add(game.Name); // the name exists but every row is missing a field
+                }
+                else
+                {
+                    notFound.Add(game.Name); // no row with that name at all
                 }
             }
+
+            // 4. Summary, split by reason
+            var msg = $"Games updated: {updated} of {games.Count}.";
+            msg += FormatSection("Not found (no row with that name):", notFound);
+            msg += FormatSection("Skipped as duplicate (same name on multiple complete rows):", duplicates);
+            msg += FormatSection("Skipped for a missing field:", missingField);
             PlayniteApi.Dialogs.ShowMessage(msg, "Excel Importer");
+        }
+
+        private static string FormatSection(string title, List<string> items)
+        {
+            if (items.Count == 0)
+            {
+                return string.Empty;
+            }
+            var section = "\n\n" + title + "\n - " + string.Join("\n - ", items.Take(20));
+            if (items.Count > 20)
+            {
+                section += $"\n ... and {items.Count - 20} more.";
+            }
+            return section;
         }
 
         // ============================================================
@@ -219,9 +226,9 @@ namespace ExcelMetadataImporter
         //  both included in the .NET Framework.
         // ============================================================
 
-        private List<KeyValuePair<string, Dictionary<string, ExcelRow>>> LoadAllSheets(string path)
+        private List<SheetData> LoadAllSheets(string path)
         {
-            var result = new List<KeyValuePair<string, Dictionary<string, ExcelRow>>>();
+            var result = new List<SheetData>();
 
             using (var fs = File.OpenRead(path))
             using (var zip = new ZipArchive(fs, ZipArchiveMode.Read))
@@ -262,7 +269,8 @@ namespace ExcelMetadataImporter
                         continue; // sheet without a games table
                     }
 
-                    var dict = new Dictionary<string, ExcelRow>();
+                    var data = new SheetData { Name = sheet.Key };
+
                     for (int i = headerIdx + 1; i < rows.Count; i++)
                     {
                         var gameName = Get(rows[i], nameCol);
@@ -277,19 +285,43 @@ namespace ExcelMetadataImporter
                             continue;
                         }
 
-                        dict[key] = new ExcelRow
+                        // Every real game row counts as "seen", even if incomplete.
+                        data.Seen.Add(key);
+
+                        var publisher = Get(rows[i], pubCol);
+                        var developer = Get(rows[i], devCol);
+                        var genre = Get(rows[i], genCol);
+                        var region = regCol > 0 ? Get(rows[i], regCol) : string.Empty;
+                        var rarity = rarCol > 0 ? Get(rows[i], rarCol) : string.Empty;
+
+                        // A row is a match candidate only if all imported fields are present.
+                        if (string.IsNullOrWhiteSpace(publisher) ||
+                            string.IsNullOrWhiteSpace(developer) ||
+                            string.IsNullOrWhiteSpace(genre) ||
+                            string.IsNullOrWhiteSpace(region) ||
+                            string.IsNullOrWhiteSpace(rarity))
                         {
-                            Publisher = Get(rows[i], pubCol),
-                            Developer = Get(rows[i], devCol),
-                            Genre = Get(rows[i], genCol),
-                            Region = regCol > 0 ? Get(rows[i], regCol) : string.Empty,
-                            Rarity = rarCol > 0 ? Get(rows[i], rarCol) : string.Empty
-                        };
+                            continue;
+                        }
+
+                        if (!data.Complete.TryGetValue(key, out var list))
+                        {
+                            list = new List<ExcelRow>();
+                            data.Complete[key] = list;
+                        }
+                        list.Add(new ExcelRow
+                        {
+                            Publisher = publisher,
+                            Developer = developer,
+                            Genre = genre,
+                            Region = region,
+                            Rarity = rarity
+                        });
                     }
 
-                    if (dict.Count > 0)
+                    if (data.Seen.Count > 0)
                     {
-                        result.Add(new KeyValuePair<string, Dictionary<string, ExcelRow>>(sheet.Key, dict));
+                        result.Add(data);
                     }
                 }
             }
@@ -491,7 +523,7 @@ namespace ExcelMetadataImporter
 
         private Guid GetOrCreateRegionId(string name)
         {
-            // Apply the alias if any (e.g. "Jap" -> "Japan")
+            // Apply the alias if any (e.g. "Pal" -> "PAL")
             if (RegionAliases.TryGetValue(name, out var mapped))
             {
                 name = mapped;
@@ -565,6 +597,17 @@ namespace ExcelMetadataImporter
             public string Genre { get; set; }
             public string Region { get; set; }
             public string Rarity { get; set; }
+        }
+
+        private class SheetData
+        {
+            public string Name { get; set; }
+
+            // Normalized name -> complete rows with that name (more than one = ambiguous duplicate)
+            public Dictionary<string, List<ExcelRow>> Complete { get; } = new Dictionary<string, List<ExcelRow>>();
+
+            // Every game name encountered on the sheet, complete or not
+            public HashSet<string> Seen { get; } = new HashSet<string>();
         }
     }
 }
