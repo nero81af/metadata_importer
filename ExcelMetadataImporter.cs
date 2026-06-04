@@ -14,21 +14,35 @@ namespace ExcelMetadataImporter
     {
         private static readonly ILogger logger = LogManager.GetLogger();
 
-        // Ogni plugin deve avere un GUID univoco. Generane uno tuo e incollalo qui sotto.
+        // Every plugin must have a unique GUID. Generate your own and paste it below.
         public override Guid Id { get; } = Guid.Parse("837f7763-5d5b-4006-a993-2657ca63b549");
 
-        // Percorso fisso del tuo Excel. Lascialo vuoto per far comparire ogni volta
-        // la finestra di selezione del file.
-        private const string DefaultExcelPath = @""; // es. @"D:\giochi\collection.xlsx"
+        // Fixed path to your Excel file. Leave it empty to show the file picker every time.
+        private const string DefaultExcelPath = @""; // e.g. @"D:\games\collection.xlsx"
 
-        // Nomi delle colonne dei metadati, cercati nell'intestazione della tabella giochi
-        // (case-insensitive). La colonna del NOME gioco viene rilevata automaticamente come
-        // prima colonna usata della riga di intestazione ("Game Digital" / "Game Physical").
+        // Names of the metadata columns, looked up in the games table header (case-insensitive).
+        // The game NAME column does not need to be configured: it is detected automatically as
+        // the first used cell of the header row ("Game Digital" / "Game Physical").
         private const string ColPublisher = "Publisher";
         private const string ColDeveloper = "Developer";
         private const string ColGenre = "Genre";
+        private const string ColRegion = "Region";
 
-        // Righe che non sono giochi e vanno ignorate (etichette/intestazioni ripetute).
+        // Maps the sheet's region values to cleaner names for Playnite. Values not listed here
+        // are used as-is. Empty the map if you want to keep the original sheet values.
+        private static readonly Dictionary<string, string> RegionAliases = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            { "Pal", "PAL" },
+            { "Usa", "USA" }
+        };
+
+        private const string ColRarity = "Rarity";
+
+        // UserScore assigned based on the number of asterisks (index = asterisk count; index 0 is unused).
+        // 10 levels, from 1 to 10 asterisks -> from 10 to 100, in steps of 10.
+        private static readonly int[] RarityScores = { 0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100 };
+
+        // Rows that are not games and must be ignored (labels / repeated headers).
         private static readonly HashSet<string> SkipNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         {
             "Wishlist Digital", "Wishlist Physical", "Game Digital", "Game Physical"
@@ -42,7 +56,7 @@ namespace ExcelMetadataImporter
         {
             yield return new GameMenuItem
             {
-                Description = "Importa metadati da Excel (riga corrispondente)",
+                Description = "Import metadata from Excel (matching row)",
                 MenuSection = "Excel Importer",
                 Action = a => ImportFromExcel(a.Games)
             };
@@ -55,7 +69,7 @@ namespace ExcelMetadataImporter
                 return;
             }
 
-            // 1. Trova il file Excel
+            // 1. Locate the Excel file
             var path = DefaultExcelPath;
             if (string.IsNullOrEmpty(path) || !File.Exists(path))
             {
@@ -63,24 +77,69 @@ namespace ExcelMetadataImporter
             }
             if (string.IsNullOrEmpty(path) || !File.Exists(path))
             {
-                return; // utente ha annullato
+                return; // user cancelled
             }
 
-            // 2. Carica l'Excel in un dizionario (nome gioco normalizzato -> riga)
-            Dictionary<string, ExcelRow> table;
+            // 2. Load every sheet separately (sheet name -> rows keyed by game name)
+            List<KeyValuePair<string, Dictionary<string, ExcelRow>>> sheets;
             try
             {
-                table = LoadExcel(path);
+                sheets = LoadAllSheets(path);
             }
             catch (Exception ex)
             {
-                logger.Error(ex, "Errore nella lettura dell'Excel.");
+                logger.Error(ex, "Error reading the Excel file.");
                 PlayniteApi.Dialogs.ShowErrorMessage(
-                    "Impossibile leggere il file Excel:\n" + ex.Message, "Excel Importer");
+                    "Could not read the Excel file:\n" + ex.Message, "Excel Importer");
                 return;
             }
 
-            // 3. Per ogni gioco selezionato: cerca la riga e aggiorna i campi
+            if (sheets.Count == 0)
+            {
+                PlayniteApi.Dialogs.ShowMessage("No sheet with a games table was found.", "Excel Importer");
+                return;
+            }
+
+            // 2b. Let the user choose which sheet to import from
+            const string allSheetsLabel = "(All sheets)";
+            var options = new List<GenericItemOption>
+            {
+                new GenericItemOption(allSheetsLabel, "Import from every sheet (merged)")
+            };
+            options.AddRange(sheets.Select(s => new GenericItemOption(s.Key, $"{s.Value.Count} games")));
+
+            var chosen = PlayniteApi.Dialogs.ChooseItemWithSearch(
+                options,
+                query => string.IsNullOrEmpty(query)
+                    ? options
+                    : options.Where(o => o.Name.IndexOf(query, StringComparison.OrdinalIgnoreCase) >= 0).ToList(),
+                null,
+                "Choose the Excel sheet to import from");
+
+            if (chosen == null)
+            {
+                return; // user cancelled
+            }
+
+            // Build the lookup table from the chosen sheet (or merge all)
+            Dictionary<string, ExcelRow> table;
+            if (chosen.Name == allSheetsLabel)
+            {
+                table = new Dictionary<string, ExcelRow>();
+                foreach (var sheet in sheets)
+                {
+                    foreach (var kv in sheet.Value)
+                    {
+                        table[kv.Key] = kv.Value; // on duplicates the last sheet wins
+                    }
+                }
+            }
+            else
+            {
+                table = sheets.First(s => s.Key == chosen.Name).Value;
+            }
+
+            // 3. For each selected game: find the row and update the fields
             int updated = 0;
             var notFound = new List<string>();
 
@@ -116,6 +175,23 @@ namespace ExcelMetadataImporter
                     changed = true;
                 }
 
+                if (!string.IsNullOrWhiteSpace(row.Region))
+                {
+                    game.RegionIds = SplitRegions(row.Region)
+                        .Select(GetOrCreateRegionId).ToList();
+                    changed = true;
+                }
+
+                if (!string.IsNullOrWhiteSpace(row.Rarity))
+                {
+                    int stars = row.Rarity.Count(c => c == '*');
+                    if (stars >= 1 && stars < RarityScores.Length)
+                    {
+                        game.UserScore = RarityScores[stars];
+                        changed = true;
+                    }
+                }
+
                 if (changed)
                 {
                     PlayniteApi.Database.Games.Update(game);
@@ -123,29 +199,29 @@ namespace ExcelMetadataImporter
                 }
             }
 
-            // 4. Riepilogo
-            var msg = $"Giochi aggiornati: {updated} su {games.Count}.";
+            // 4. Summary
+            var msg = $"Games updated: {updated} of {games.Count}.";
             if (notFound.Count > 0)
             {
-                msg += "\n\nNessuna riga trovata per:\n - " + string.Join("\n - ", notFound.Take(20));
+                msg += "\n\nNo matching row found for:\n - " + string.Join("\n - ", notFound.Take(20));
                 if (notFound.Count > 20)
                 {
-                    msg += $"\n ... e altri {notFound.Count - 20}.";
+                    msg += $"\n ... and {notFound.Count - 20} more.";
                 }
             }
             PlayniteApi.Dialogs.ShowMessage(msg, "Excel Importer");
         }
 
         // ============================================================
-        //  Lettura .xlsx SENZA dipendenze esterne.
-        //  Un .xlsx e' uno zip di file XML: lo apriamo con
-        //  System.IO.Compression e leggiamo l'XML con System.Xml.Linq,
-        //  entrambi inclusi nel .NET Framework.
+        //  Reading .xlsx WITHOUT external dependencies.
+        //  An .xlsx is a zip of XML files: we open it with
+        //  System.IO.Compression and read the XML with System.Xml.Linq,
+        //  both included in the .NET Framework.
         // ============================================================
 
-        private Dictionary<string, ExcelRow> LoadExcel(string path)
+        private List<KeyValuePair<string, Dictionary<string, ExcelRow>>> LoadAllSheets(string path)
         {
-            var result = new Dictionary<string, ExcelRow>();
+            var result = new List<KeyValuePair<string, Dictionary<string, ExcelRow>>>();
 
             using (var fs = File.OpenRead(path))
             using (var zip = new ZipArchive(fs, ZipArchiveMode.Read))
@@ -162,9 +238,9 @@ namespace ExcelMetadataImporter
 
                     var rows = ReadSheetRows(entry, shared);
 
-                    // Trova l'intestazione della tabella giochi: la riga che contiene
-                    // contemporaneamente Developer, Publisher e Genre.
-                    int headerIdx = -1, devCol = 0, pubCol = 0, genCol = 0, nameCol = 0;
+                    // Find the games table header: the row that contains
+                    // Developer, Publisher and Genre at the same time.
+                    int headerIdx = -1, devCol = 0, pubCol = 0, genCol = 0, regCol = 0, rarCol = 0, nameCol = 0;
                     for (int i = 0; i < rows.Count; i++)
                     {
                         int d = FindCol(rows[i], ColDeveloper);
@@ -174,16 +250,19 @@ namespace ExcelMetadataImporter
                         {
                             headerIdx = i;
                             devCol = d; pubCol = p; genCol = g;
-                            nameCol = rows[i].Keys.Min(); // prima colonna usata = nome gioco
+                            regCol = FindCol(rows[i], ColRegion); // 0 if the column is missing
+                            rarCol = FindCol(rows[i], ColRarity); // 0 if the column is missing
+                            nameCol = rows[i].Keys.Min(); // first used column = game name
                             break;
                         }
                     }
 
                     if (headerIdx < 0)
                     {
-                        continue; // foglio senza tabella giochi
+                        continue; // sheet without a games table
                     }
 
+                    var dict = new Dictionary<string, ExcelRow>();
                     for (int i = headerIdx + 1; i < rows.Count; i++)
                     {
                         var gameName = Get(rows[i], nameCol);
@@ -198,12 +277,19 @@ namespace ExcelMetadataImporter
                             continue;
                         }
 
-                        result[key] = new ExcelRow
+                        dict[key] = new ExcelRow
                         {
                             Publisher = Get(rows[i], pubCol),
                             Developer = Get(rows[i], devCol),
-                            Genre = Get(rows[i], genCol)
+                            Genre = Get(rows[i], genCol),
+                            Region = regCol > 0 ? Get(rows[i], regCol) : string.Empty,
+                            Rarity = rarCol > 0 ? Get(rows[i], rarCol) : string.Empty
                         };
+                    }
+
+                    if (dict.Count > 0)
+                    {
+                        result.Add(new KeyValuePair<string, Dictionary<string, ExcelRow>>(sheet.Key, dict));
                     }
                 }
             }
@@ -211,7 +297,7 @@ namespace ExcelMetadataImporter
             return result;
         }
 
-        // Tabella delle stringhe condivise (xl/sharedStrings.xml)
+        // Shared strings table (xl/sharedStrings.xml)
         private static List<string> ReadSharedStrings(ZipArchive zip)
         {
             var list = new List<string>();
@@ -225,7 +311,7 @@ namespace ExcelMetadataImporter
                 var doc = XDocument.Load(s);
                 foreach (var si in doc.Root.Elements().Where(e => e.Name.LocalName == "si"))
                 {
-                    // Concatena tutti i <t> (gestisce anche il rich text <r><t>)
+                    // Concatenate all <t> elements (handles rich text <r><t> too)
                     var text = string.Concat(si.Descendants()
                         .Where(e => e.Name.LocalName == "t")
                         .Select(e => e.Value));
@@ -235,7 +321,7 @@ namespace ExcelMetadataImporter
             return list;
         }
 
-        // Elenco fogli in ordine: nome -> percorso file (es. "worksheets/sheet1.xml")
+        // Ordered list of sheets: name -> file path (e.g. "worksheets/sheet1.xml")
         private static List<KeyValuePair<string, string>> ReadSheetTargets(ZipArchive zip)
         {
             var result = new List<KeyValuePair<string, string>>();
@@ -257,7 +343,7 @@ namespace ExcelMetadataImporter
                     var target = (string)rel.Attribute("Target");
                     if (id != null && target != null)
                     {
-                        // Normalizza eventuali percorsi assoluti tipo "/xl/worksheets/..."
+                        // Normalize any absolute paths such as "/xl/worksheets/..."
                         target = target.Replace("/xl/", "").TrimStart('/');
                         relMap[id] = target;
                     }
@@ -285,7 +371,7 @@ namespace ExcelMetadataImporter
             return result;
         }
 
-        // Legge le righe di un foglio: per ogni riga, dizionario colonna(1-based) -> testo
+        // Reads the rows of a sheet: for each row, a dictionary column(1-based) -> text
         private static List<Dictionary<int, string>> ReadSheetRows(ZipArchiveEntry entry, List<string> shared)
         {
             var rows = new List<Dictionary<int, string>>();
@@ -312,19 +398,19 @@ namespace ExcelMetadataImporter
                         var t = (string)c.Attribute("t");
                         string value;
 
-                        if (t == "s") // stringa condivisa
+                        if (t == "s") // shared string
                         {
                             var v = c.Elements().FirstOrDefault(e => e.Name.LocalName == "v");
                             value = (v != null && int.TryParse(v.Value, out int idx) && idx >= 0 && idx < shared.Count)
                                 ? shared[idx] : "";
                         }
-                        else if (t == "inlineStr") // stringa inline
+                        else if (t == "inlineStr") // inline string
                         {
                             value = string.Concat(c.Descendants()
                                 .Where(e => e.Name.LocalName == "t")
                                 .Select(e => e.Value));
                         }
-                        else // numero o stringa formula
+                        else // number or formula string
                         {
                             var v = c.Elements().FirstOrDefault(e => e.Name.LocalName == "v");
                             value = v != null ? v.Value : "";
@@ -375,7 +461,7 @@ namespace ExcelMetadataImporter
             return row.TryGetValue(col, out var v) ? v.Trim() : string.Empty;
         }
 
-        // --- Helper: get-or-create per evitare duplicati nel database ---
+        // --- Helpers: get-or-create to avoid duplicates in the database ---
 
         private Guid GetOrCreateCompanyId(string name)
         {
@@ -403,7 +489,26 @@ namespace ExcelMetadataImporter
             return genre.Id;
         }
 
-        // --- Helper: normalizzazione e split ---
+        private Guid GetOrCreateRegionId(string name)
+        {
+            // Apply the alias if any (e.g. "Jap" -> "Japan")
+            if (RegionAliases.TryGetValue(name, out var mapped))
+            {
+                name = mapped;
+            }
+
+            var existing = PlayniteApi.Database.Regions
+                .FirstOrDefault(r => string.Equals(r.Name, name, StringComparison.OrdinalIgnoreCase));
+            if (existing != null)
+            {
+                return existing.Id;
+            }
+            var region = new Region(name);
+            PlayniteApi.Database.Regions.Add(region);
+            return region.Id;
+        }
+
+        // --- Helpers: normalization and splitting ---
 
         private static string Normalize(string s)
         {
@@ -414,11 +519,11 @@ namespace ExcelMetadataImporter
 
             s = s.Trim().ToLowerInvariant();
 
-            // Apostrofi e virgolette "ricurvi" -> dritti (es. Demon's Souls)
+            // Curly apostrophes and quotes -> straight ones (e.g. Demon's Souls)
             s = s.Replace('\u2019', '\'').Replace('\u2018', '\'')
                  .Replace('\u201C', '"').Replace('\u201D', '"');
 
-            // Simboli di marchio
+            // Trademark symbols
             s = s.Replace("\u2122", "").Replace("\u00AE", "").Replace("\u00A9", "");
 
             while (s.Contains("  "))
@@ -429,7 +534,7 @@ namespace ExcelMetadataImporter
             return s.Trim();
         }
 
-        // Publisher/Developer multipli separati da ';'
+        // Multiple publishers/developers separated by ';'
         private static IEnumerable<string> SplitCompanies(string value)
         {
             return value.Split(';')
@@ -437,8 +542,16 @@ namespace ExcelMetadataImporter
                 .Where(x => !string.IsNullOrEmpty(x));
         }
 
-        // Generi multipli separati da ',' o ';'
+        // Multiple genres separated by ',' or ';'
         private static IEnumerable<string> SplitGenres(string value)
+        {
+            return value.Split(',', ';')
+                .Select(x => x.Trim())
+                .Where(x => !string.IsNullOrEmpty(x));
+        }
+
+        // Multiple regions separated by ',' or ';'
+        private static IEnumerable<string> SplitRegions(string value)
         {
             return value.Split(',', ';')
                 .Select(x => x.Trim())
@@ -450,6 +563,8 @@ namespace ExcelMetadataImporter
             public string Publisher { get; set; }
             public string Developer { get; set; }
             public string Genre { get; set; }
+            public string Region { get; set; }
+            public string Rarity { get; set; }
         }
     }
 }
